@@ -22,7 +22,9 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEVELOPER_ID = int(os.getenv("DEVELOPER_ID", 0))
 
 # Expanded profanity list including severe violations
-PROFANITIES = [ "porn", "nsfw", "xxx", "onlyfans", 
+PROFANITIES = [
+    "damn", 
+    "porn", "nsfw", "xxx", "onlyfans", 
     "child abuse", "cp", "pedophile", "pedo"
 ]
 
@@ -47,11 +49,12 @@ async def check_user_and_ban(user: User, chat: Chat, context: ContextTypes.DEFAU
         if profanity in full_name:
             logger.info(f"Profanity `{profanity}` detected in user {user.id} ({full_name}). Banning...")
             try:
-                await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id)
-                logger.info(f"Successfully banned {user.id} from {chat.id}")
+                # revoke_messages=True ensures all their past messages in the group are deleted
+                await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, revoke_messages=True)
+                logger.info(f"Successfully banned {user.id} from {chat.id} and deleted their messages.")
                 return True
             except Exception as e:
-                logger.error(f"Failed to ban user {user.id}: {e}")
+                logger.error(f"Failed to ban user {user.id} and revoke messages: {e}")
             break
     return False
 
@@ -224,6 +227,29 @@ async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await status_message.edit_text(f"🌍 GBAN Complete for {target_user.first_name}\n✅ Banned in {banned_count} groups\n❌ Failed in {failed_count} groups")
 
 
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Starts the bot. Mostly useful for PMs or initial group setup."""
+    bot_info = await context.bot.get_me()
+    await update.message.reply_text(
+        f"🤖 Hello! I am {bot_info.first_name}.\n"
+        "I actively monitor chat members for profanity in their names, and I offer powerful moderation tools.\n"
+        "Make sure I am an Administrator with 'Ban Users' and 'Delete Messages' permissions!"
+    )
+
+async def deleteall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Deletes all messages from a specific user."""
+    if not await require_admin(update, context): return
+    target_user = update.message.reply_to_message.from_user
+    chat = update.effective_chat
+    try:
+        # Telegram API doesn't have a direct 'delete_all_messages' method that works
+        # without banning, unless we unban immediately. We can ban with revoke_messages, then unban.
+        await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user.id, revoke_messages=True)
+        await context.bot.unban_chat_member(chat_id=chat.id, user_id=target_user.id, only_if_banned=True)
+        await update.message.reply_text(f"🧹 All recent messages from {target_user.first_name} have been wiped.")
+    except Exception as e:
+        await update.message.reply_text(f"Failed to delete all messages: {e}")
+
 def main() -> None:
     """Start the bot."""
     if not BOT_TOKEN:
@@ -233,12 +259,14 @@ def main() -> None:
     application = Application.builder().token(BOT_TOKEN).build()
 
     # Commands
+    application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(CommandHandler("kick", kick_command))
     application.add_handler(CommandHandler("mute", mute_command))
     application.add_handler(CommandHandler("unmute", unmute_command))
     application.add_handler(CommandHandler("gban", gban_command))
+    application.add_handler(CommandHandler("deleteall", deleteall_command))
 
     # Profiles updates
     application.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
