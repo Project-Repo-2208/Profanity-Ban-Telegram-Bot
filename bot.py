@@ -51,7 +51,9 @@ def contains_profanity(text: str) -> bool:
         if profanity in text: return True
     return False
 
-async def get_chat_from_link(link: str, context: ContextTypes.DEFAULT_TYPE) -> int:
+from typing import Optional, Tuple
+
+async def get_chat_from_link(link: str, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     """Try to resolve a t.me link or @username to a chat_id."""
     if link.startswith('http'):
         link = link.split('/')[-1]
@@ -154,13 +156,11 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         if len(recent) >= SPAM_LIMIT:
             try:
-                # We need to explicitly delete all tracked message IDs one by one
-                # They are admins so we don't ban them, we just delete their spam.
-                for _, mid in recent:
-                    try:
-                        await context.bot.delete_message(chat_id=chat.id, message_id=mid)
-                    except Exception as e:
-                        logger.error(f"Failed to delete admin spam message {mid}: {e}")
+                message_ids_to_delete = [mid for _, mid in recent]
+                try:
+                    await context.bot.delete_messages(chat_id=chat.id, message_ids=message_ids_to_delete)
+                except Exception as e:
+                    logger.error(f"Failed to bulk-delete admin spam: {e}")
                 
                 warning = f"🛡️ *{user.first_name}, as a guardian of this realm, your voice carries weight.*\n_Please preserve the tranquility and refrain from flooding the chat._"
                 await context.bot.send_message(chat_id=chat.id, text=warning, parse_mode="Markdown")
@@ -177,9 +177,12 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         if len(recent_media) >= MEDIA_SPAM_LIMIT:
             try:
-                for _, mid in recent_media:
-                    try: await context.bot.delete_message(chat_id=chat.id, message_id=mid)
-                    except Exception: pass
+                message_ids_to_delete = [mid for _, mid in recent_media]
+                try:
+                    await context.bot.delete_messages(chat_id=chat.id, message_ids=message_ids_to_delete)
+                except Exception as e:
+                    logger.error(f"Failed to bulk-delete sticker/GIF spam: {e}")
+                    
                 warn_msg = f"⚠️ {user.first_name}, you have sent too many stickers/GIFs. They have been removed to prevent spam."
                 await context.bot.send_message(chat_id=chat.id, text=warn_msg)
                 media_messages[chat.id][user.id] = []
@@ -188,7 +191,7 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # --- Moderation Commands ---
 
-async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, str]:
+async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[Optional[int], Optional[str]]:
     if update.message.reply_to_message:
         user = update.message.reply_to_message.from_user
         return user.id, user.first_name
@@ -212,7 +215,7 @@ async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text("❌ You must reply to a user's message or provide their @username/ID.")
     return None, None
 
-async def resolve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def resolve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Optional[int]:
     """Returns the chat ID to perform the action in."""
     if update.effective_chat.type != 'private':
         return update.effective_chat.id
