@@ -132,10 +132,15 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # 4. Profanity in Text/Caption
     if contains_profanity(message.text or message.caption or ""):
         try:
-            await message.delete()
             if not is_admin:
+                # Banning with revoke_messages=True automatically deletes all their past and present messages in one blow.
                 await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, revoke_messages=True)
-        except Exception: pass
+                logger.info(f"Banned user {user.id} and wiped history for profanity in text.")
+            else:
+                # If they are an admin, we only delete the offending message.
+                await message.delete()
+        except Exception as e:
+            logger.error(f"Failed to handle profanity in text: {e}")
         return
 
     now = time.time()
@@ -149,13 +154,19 @@ async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         
         if len(recent) >= SPAM_LIMIT:
             try:
+                # We need to explicitly delete all tracked message IDs one by one
+                # They are admins so we don't ban them, we just delete their spam.
                 for _, mid in recent:
-                    try: await context.bot.delete_message(chat_id=chat.id, message_id=mid)
-                    except Exception: pass
-                warning = "🛡️ *As a guardian of this realm, your voice carries weight.*\n_Please preserve the tranquility and refrain from flooding the chat._"
+                    try:
+                        await context.bot.delete_message(chat_id=chat.id, message_id=mid)
+                    except Exception as e:
+                        logger.error(f"Failed to delete admin spam message {mid}: {e}")
+                
+                warning = f"🛡️ *{user.first_name}, as a guardian of this realm, your voice carries weight.*\n_Please preserve the tranquility and refrain from flooding the chat._"
                 await context.bot.send_message(chat_id=chat.id, text=warning, parse_mode="Markdown")
                 admin_messages[chat.id][user.id] = []
-            except Exception: pass
+            except Exception as e:
+                logger.error(f"Failed to handle admin spam cycle: {e}")
 
     # 6. Sticker/GIF Spam Protection
     if message.sticker or message.animation:
