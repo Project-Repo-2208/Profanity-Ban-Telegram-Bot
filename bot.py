@@ -21,45 +21,62 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEVELOPER_ID = int(os.getenv("DEVELOPER_ID", 0))
 
-# Expanded profanity list including severe violations
+# Expanded profanity list
 PROFANITIES = [
     "damn", 
     "porn", "nsfw", "xxx", "onlyfans", 
     "child abuse", "cp", "pedophile", "pedo"
 ]
 
-# Track admin messages for spam protection mapping chat_id -> user_id -> list[timestamps]
+# Track admin messages: chat_id -> user_id -> list of (timestamp, message_id)
 admin_messages = defaultdict(lambda: defaultdict(list))
 SPAM_LIMIT = 5
 SPAM_TIME_WINDOW = 3.0 # seconds
 
-# Track which groups the bot is in
+# Track stickers/gifs: chat_id -> user_id -> list of (timestamp, message_id)
+media_messages = defaultdict(lambda: defaultdict(list))
+MEDIA_SPAM_LIMIT = 20
+MEDIA_TIME_WINDOW = 30 * 60.0 # 30 minutes in seconds
+
+# Track global chats and username mappings
 known_chats = set()
+username_to_id = {}
 
-async def check_user_and_ban(user: User, chat: Chat, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Checks a user's name for profanity and bans them if found. Returns True if banned."""
-    if not user or not chat:
-        return False
-        
-    first_name = user.first_name or ""
-    last_name = user.last_name or ""
-    full_name = f"{first_name} {last_name}".lower()
+START_TIME = time.time()
 
+def contains_profanity(text: str) -> bool:
+    if not text: return False
+    text = text.lower()
     for profanity in PROFANITIES:
-        if profanity in full_name:
-            logger.info(f"Profanity `{profanity}` detected in user {user.id} ({full_name}). Banning...")
-            try:
-                # revoke_messages=True ensures all their past messages in the group are deleted
-                await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, revoke_messages=True)
-                logger.info(f"Successfully banned {user.id} from {chat.id} and deleted their messages.")
-                return True
-            except Exception as e:
-                logger.error(f"Failed to ban user {user.id} and revoke messages: {e}")
-            break
+        if profanity in text: return True
+    return False
+
+async def get_chat_from_link(link: str, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Try to resolve a t.me link or @username to a chat_id."""
+    if link.startswith('http'):
+        link = link.split('/')[-1]
+    if not link.startswith('@'):
+        link = f"@{link}"
+    try:
+        chat = await context.bot.get_chat(link)
+        return chat.id
+    except Exception:
+        return None
+
+async def check_user_name_and_ban(user: User, chat: Chat, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    if not user or not chat: return False
+    if chat.type == 'private': return False # Dont ban people for their name in DMs
+        
+    full_name = f"{user.first_name or ''} {user.last_name or ''}"
+    if contains_profanity(full_name):
+        try:
+            await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, revoke_messages=True)
+            return True
+        except Exception:
+            pass
     return False
 
 async def is_user_admin(chat: Chat, user_id: int) -> bool:
-    """Helper to check if a user is an admin in a chat."""
     try:
         member = await chat.get_member(user_id)
         return member.status in ['administrator', 'creator']
@@ -67,215 +84,279 @@ async def is_user_admin(chat: Chat, user_id: int) -> bool:
         return False
 
 async def handle_chat_member_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Triggered when a member's status changes, including name changes (if bot is admin)."""
     result = update.chat_member
-    if not result:
-        return
-        
+    if not result: return
     user = result.new_chat_member.user
     chat = update.effective_chat
-    
-    # Track the chat
-    if chat:
+    if chat and chat.type != 'private':
         known_chats.add(chat.id)
-
-    await check_user_and_ban(user, chat, context)
+    if user.username:
+        username_to_id[user.username.lower()] = user.id
+    await check_user_name_and_ban(user, chat, context)
     
 async def handle_any_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Triggered on every single message to check the sender's name instantly and track admin spam."""
     user = update.effective_user
     chat = update.effective_chat
     message = update.message
     
-    if not user or not chat or not message:
-        return
+    if not user or not chat or not message: return
+    if chat.type != 'private': known_chats.add(chat.id)
+    if user.username: username_to_id[user.username.lower()] = user.id
 
-    # Track chat
-    known_chats.add(chat.id)
-    
-    # 1. Check for Profanity in Name
-    if await check_user_and_ban(user, chat, context):
+    # 1. Channel Ban (If a channel posts in the group, and it's not an automatic forward)
+    if message.sender_chat and message.sender_chat.type == 'channel' and not message.is_automatic_forward:
         try:
             await message.delete()
-        except Exception as e:
-            logger.error(f"Failed to delete message from banned user: {e}")
-        return # User is banned, stop processing
+            await context.bot.ban_chat_sender_chat(chat_id=chat.id, sender_chat_id=message.sender_chat.id)
+        except Exception:
+            pass
+        return
+        
+    # Ignore DMs for moderation filters
+    if chat.type == 'private': return
 
-    # 2. Admin Spam Protection
-    if chat.type in ['group', 'supergroup']:
-        if await is_user_admin(chat, user.id):
-            now = time.time()
-            user_msgs = admin_messages[chat.id][user.id]
-            
-            # Remove old messages outside the time window
-            user_msgs = [ts for ts in user_msgs if now - ts <= SPAM_TIME_WINDOW]
-            user_msgs.append(now)
-            admin_messages[chat.id][user.id] = user_msgs
-            
-            if len(user_msgs) >= SPAM_LIMIT:
-                # Spam detected
-                try:
-                    await message.delete()
-                    warning_msg = "🛡️ *As a guardian of this realm, your voice carries weight.*\n_Please preserve the tranquility and refrain from flooding the chat._"
-                    await context.bot.send_message(chat_id=chat.id, text=warning_msg, parse_mode="Markdown")
-                    # Clear their history so we don't spam the warning on msg 6, 7, 8...
-                    admin_messages[chat.id][user.id] = []
-                except Exception as e:
-                    logger.error(f"Failed to handle admin spam: {e}")
+    # 2. Profanity Check in Name
+    if await check_user_name_and_ban(user, chat, context):
+        try: await message.delete()
+        except Exception: pass
+        return
+
+    # 3. Join/Leave Message Deletion
+    if message.new_chat_members or message.left_chat_member:
+        try: await message.delete()
+        except Exception: pass
+        return
+
+    is_admin = await is_user_admin(chat, user.id)
+
+    # 4. Profanity in Text/Caption
+    if contains_profanity(message.text or message.caption or ""):
+        try:
+            await message.delete()
+            if not is_admin:
+                await context.bot.ban_chat_member(chat_id=chat.id, user_id=user.id, revoke_messages=True)
+        except Exception: pass
+        return
+
+    now = time.time()
+
+    # 5. Admin Spam Protection
+    if is_admin:
+        recent = admin_messages[chat.id][user.id]
+        recent = [(ts, mid) for ts, mid in recent if now - ts <= SPAM_TIME_WINDOW]
+        recent.append((now, message.message_id))
+        admin_messages[chat.id][user.id] = recent
+        
+        if len(recent) >= SPAM_LIMIT:
+            try:
+                for _, mid in recent:
+                    try: await context.bot.delete_message(chat_id=chat.id, message_id=mid)
+                    except Exception: pass
+                warning = "🛡️ *As a guardian of this realm, your voice carries weight.*\n_Please preserve the tranquility and refrain from flooding the chat._"
+                await context.bot.send_message(chat_id=chat.id, text=warning, parse_mode="Markdown")
+                admin_messages[chat.id][user.id] = []
+            except Exception: pass
+
+    # 6. Sticker/GIF Spam Protection
+    if message.sticker or message.animation:
+        recent_media = media_messages[chat.id][user.id]
+        recent_media = [(ts, mid) for ts, mid in recent_media if now - ts <= MEDIA_TIME_WINDOW]
+        recent_media.append((now, message.message_id))
+        media_messages[chat.id][user.id] = recent_media
+        
+        if len(recent_media) >= MEDIA_SPAM_LIMIT:
+            try:
+                for _, mid in recent_media:
+                    try: await context.bot.delete_message(chat_id=chat.id, message_id=mid)
+                    except Exception: pass
+                warn_msg = f"⚠️ {user.first_name}, you have sent too many stickers/GIFs. They have been removed to prevent spam."
+                await context.bot.send_message(chat_id=chat.id, text=warn_msg)
+                media_messages[chat.id][user.id] = []
+            except Exception: pass
+
 
 # --- Moderation Commands ---
 
-async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Ensure the user is an admin answering to a message."""
-    user = update.effective_user
-    chat = update.effective_chat
-    if not await is_user_admin(chat, user.id):
+async def resolve_target(update: Update, context: ContextTypes.DEFAULT_TYPE) -> tuple[int, str]:
+    if update.message.reply_to_message:
+        user = update.message.reply_to_message.from_user
+        return user.id, user.first_name
+    
+    args = [a for a in context.args if not (a.startswith('t.me/') or a.startswith('http') or (a.startswith('@') and "://" not in a and a[1:].lower() not in username_to_id))]
+    if args:
+        arg = args[0]
+        if arg.startswith('@'):
+            uname = arg[1:].lower()
+            if uname in username_to_id: return username_to_id[uname], arg
+        elif arg.lstrip('-').isdigit():
+            return int(arg), f"ID:{arg}"
+            
+    # For DMs, the developer might just provide username without having replied
+    for arg in context.args or []:
+        if arg.startswith('@'):
+            uname = arg[1:].lower()
+            if uname in username_to_id:
+                return username_to_id[uname], arg
+                
+    await update.message.reply_text("❌ You must reply to a user's message or provide their @username/ID.")
+    return None, None
+
+async def resolve_chat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Returns the chat ID to perform the action in."""
+    if update.effective_chat.type != 'private':
+        return update.effective_chat.id
+    # If in DM, look for a group link in args
+    for arg in context.args or []:
+        if 't.me/' in arg or arg.startswith('http') or arg.startswith('@'):
+            # Only treat as group if it's not the target user
+            if arg.startswith('@') and arg[1:].lower() in username_to_id and len(context.args) == 1:
+                continue # It's just the user
+            cid = await get_chat_from_link(arg, context)
+            if cid: return cid
+    await update.message.reply_text("❌ When using this command in DMs, please provide a group link like t.me/GroupLink.")
+    return None
+
+async def require_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> bool:
+    user_id = update.effective_user.id
+    if user_id == DEVELOPER_ID: return True
+    if not await is_user_admin(await context.bot.get_chat(chat_id), user_id):
         await update.message.reply_text("❌ You must be an admin to use this command.")
-        return False
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ You must reply to a user's message to use this command.")
         return False
     return True
 
 async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context): return
-    target_user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
+    chat_id = await resolve_chat(update, context)
+    if not chat_id: return
+    if not await require_admin(update, context, chat_id): return
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
     try:
-        await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user.id)
-        await update.message.reply_text(f"🔨 {target_user.first_name} has been permanently banned.")
+        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+        await update.message.reply_text(f"🔨 {target_name} has been permanently banned.")
     except Exception as e:
         await update.message.reply_text(f"Failed to ban: {e}")
 
 async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context): return
-    target_user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
+    chat_id = await resolve_chat(update, context)
+    if not chat_id: return
+    if not await require_admin(update, context, chat_id): return
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
     try:
-        await context.bot.unban_chat_member(chat_id=chat.id, user_id=target_user.id, only_if_banned=True)
-        await update.message.reply_text(f"🕊️ {target_user.first_name} has been unbanned.")
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id, only_if_banned=True)
+        await update.message.reply_text(f"🕊️ {target_name} has been unbanned.")
     except Exception as e:
         await update.message.reply_text(f"Failed to unban: {e}")
 
 async def kick_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context): return
-    target_user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
+    chat_id = await resolve_chat(update, context)
+    if not chat_id: return
+    if not await require_admin(update, context, chat_id): return
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
     try:
-        await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user.id)
-        await context.bot.unban_chat_member(chat_id=chat.id, user_id=target_user.id) # Unbanning allows them to rejoin
-        await update.message.reply_text(f"👢 {target_user.first_name} has been kicked from the group.")
+        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id)
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id)
+        await update.message.reply_text(f"👢 {target_name} has been kicked.")
     except Exception as e:
         await update.message.reply_text(f"Failed to kick: {e}")
 
 async def mute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context): return
-    target_user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
+    chat_id = await resolve_chat(update, context)
+    if not chat_id: return
+    if not await require_admin(update, context, chat_id): return
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
     try:
-        permissions = ChatPermissions(can_send_messages=False)
-        await context.bot.restrict_chat_member(chat_id=chat.id, user_id=target_user.id, permissions=permissions)
-        await update.message.reply_text(f"🔇 {target_user.first_name} has been muted.")
+        await context.bot.restrict_chat_member(chat_id=chat_id, user_id=target_id, permissions=ChatPermissions(can_send_messages=False))
+        await update.message.reply_text(f"🔇 {target_name} has been muted.")
     except Exception as e:
         await update.message.reply_text(f"Failed to mute: {e}")
 
 async def unmute_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await require_admin(update, context): return
-    target_user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
+    chat_id = await resolve_chat(update, context)
+    if not chat_id: return
+    if not await require_admin(update, context, chat_id): return
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
     try:
-        # Default permissions to allow sending messages
-        permissions = ChatPermissions(
-            can_send_messages=True,
-            can_send_audios=True,
-            can_send_documents=True,
-            can_send_photos=True,
-            can_send_videos=True,
-            can_send_video_notes=True,
-            can_send_voice_notes=True,
-            can_send_polls=True,
-            can_send_other_messages=True,
-            can_add_web_page_previews=True
-        )
-        await context.bot.restrict_chat_member(chat_id=chat.id, user_id=target_user.id, permissions=permissions)
-        await update.message.reply_text(f"🔊 {target_user.first_name} has been unmuted.")
+        perms = ChatPermissions(can_send_messages=True, can_send_audios=True, can_send_documents=True, can_send_photos=True, can_send_videos=True, can_send_video_notes=True, can_send_voice_notes=True, can_send_polls=True, can_send_other_messages=True, can_add_web_page_previews=True)
+        await context.bot.restrict_chat_member(chat_id=chat_id, user_id=target_id, permissions=perms)
+        await update.message.reply_text(f"🔊 {target_name} has been unmuted.")
     except Exception as e:
         await update.message.reply_text(f"Failed to unmute: {e}")
 
-async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user = update.effective_user
-    if user.id != DEVELOPER_ID:
-        await update.message.reply_text("❌ This command is restricted to the bot developer.")
-        return
-    if not update.message.reply_to_message:
-        await update.message.reply_text("❌ You must reply to a user's message to gban them.")
-        return
-        
-    target_user = update.message.reply_to_message.from_user
-    banned_count = 0
-    failed_count = 0
-    
-    status_message = await update.message.reply_text(f"Starting global ban for {target_user.first_name}...")
-    
-    for chat_id in list(known_chats):
-        try:
-            await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_user.id)
-            banned_count += 1
-        except Exception:
-            failed_count += 1
-            
-    await status_message.edit_text(f"🌍 GBAN Complete for {target_user.first_name}\n✅ Banned in {banned_count} groups\n❌ Failed in {failed_count} groups")
-
-
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Starts the bot. Mostly useful for PMs or initial group setup."""
-    bot_info = await context.bot.get_me()
-    await update.message.reply_text(
-        f"🤖 Hello! I am {bot_info.first_name}.\n"
-        "I actively monitor chat members for profanity in their names, and I offer powerful moderation tools.\n"
-        "Make sure I am an Administrator with 'Ban Users' and 'Delete Messages' permissions!"
-    )
-
 async def deleteall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Deletes all messages from a specific user."""
-    if not await require_admin(update, context): return
-    target_user = update.message.reply_to_message.from_user
-    chat = update.effective_chat
+    chat_id = await resolve_chat(update, context)
+    if not chat_id: return
+    if not await require_admin(update, context, chat_id): return
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
     try:
-        # Telegram API doesn't have a direct 'delete_all_messages' method that works
-        # without banning, unless we unban immediately. We can ban with revoke_messages, then unban.
-        await context.bot.ban_chat_member(chat_id=chat.id, user_id=target_user.id, revoke_messages=True)
-        await context.bot.unban_chat_member(chat_id=chat.id, user_id=target_user.id, only_if_banned=True)
-        await update.message.reply_text(f"🧹 All recent messages from {target_user.first_name} have been wiped.")
+        await context.bot.ban_chat_member(chat_id=chat_id, user_id=target_id, revoke_messages=True)
+        await context.bot.unban_chat_member(chat_id=chat_id, user_id=target_id, only_if_banned=True)
+        await update.message.reply_text(f"🧹 All messages from {target_name} wiped.")
     except Exception as e:
         await update.message.reply_text(f"Failed to delete all messages: {e}")
 
+async def gban_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != DEVELOPER_ID:
+        await update.message.reply_text("❌ Strict Developer Command.")
+        return
+        
+    target_id, target_name = await resolve_target(update, context)
+    if not target_id: return
+    
+    banned = 0
+    failed = 0
+    status = await update.message.reply_text(f"Starting GBAN for {target_name}...")
+    for cid in list(known_chats):
+        try:
+            await context.bot.ban_chat_member(chat_id=cid, user_id=target_id, revoke_messages=True)
+            banned += 1
+        except Exception:
+            failed += 1
+    await status.edit_text(f"🌍 GBAN Complete for {target_name}\n✅ Banned in {banned} groups\n❌ Failed in {failed} groups.")
+
+async def sudo_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_user.id != DEVELOPER_ID: return
+    uptime = time.time() - START_TIME
+    await update.message.reply_text(f"🏓 Pong!\n⏳ Uptime: {uptime:.2f} seconds\n🛡️ Active in {len(known_chats)} tracked chats.")
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("🤖 Hello! I am online.\nEnsure I have Admin rights to manage messages and ban users.")
+
 def main() -> None:
-    """Start the bot."""
     if not BOT_TOKEN:
-        logger.error("BOT_TOKEN is not set in the environment or .env file.")
+        logger.error("BOT_TOKEN missing.")
         return
 
     application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Sudo
+    application.add_handler(CommandHandler("sudo", sudo_ping))
 
-    # Commands
+    # General commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
     application.add_handler(CommandHandler("kick", kick_command))
     application.add_handler(CommandHandler("mute", mute_command))
     application.add_handler(CommandHandler("unmute", unmute_command))
-    application.add_handler(CommandHandler("gban", gban_command))
     application.add_handler(CommandHandler("deleteall", deleteall_command))
+    application.add_handler(CommandHandler("gban", gban_command))
 
-    # Profiles updates
+    # Profiles updates & Generic Messages
     application.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
-    
-    # Generic Messages (Profanity Check & Spam Protection)
-    # Using group=1 so it processes AFTER the commands handled in default group 0
     application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_any_message), group=1)
 
-    logger.info("Bot is starting... (Listening to all messages and member updates)")
+    logger.info("Bot is starting...")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
