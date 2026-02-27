@@ -250,15 +250,13 @@ async def deleteall_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     except Exception as e:
         await update.message.reply_text(f"Failed to delete all messages: {e}")
 
-def main() -> None:
-    """Start the bot."""
+async def main() -> None:
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN is not set in the environment or .env file.")
         return
 
     application = Application.builder().token(BOT_TOKEN).build()
 
-    # Commands
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("ban", ban_command))
     application.add_handler(CommandHandler("unban", unban_command))
@@ -268,15 +266,15 @@ def main() -> None:
     application.add_handler(CommandHandler("gban", gban_command))
     application.add_handler(CommandHandler("deleteall", deleteall_command))
 
-    # Profiles updates
     application.add_handler(ChatMemberHandler(handle_chat_member_update, ChatMemberHandler.CHAT_MEMBER))
-    
-    # Generic Messages (Profanity Check & Spam Protection)
-    # Using group=1 so it processes AFTER the commands handled in default group 0
-    application.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, handle_any_message), group=1)
+    application.add_handler(
+        MessageHandler(filters.ALL & ~filters.COMMAND, handle_any_message),
+        group=1
+    )
 
     logger.info("Bot is starting... (Listening to all messages and member updates)")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    await application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
